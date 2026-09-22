@@ -1,0 +1,28 @@
+package com.github.h3yow.durablekvcachejava.cache;
+
+/**
+ * 对外键值缓存服务接口。
+ */
+public interface KeyValueCache {
+
+    /** 写入并返回带过期时间的最终状态描述。 */
+    PutResult put(String key, String value, Long ttlMillis);
+
+    /** 读取；不存在或已过期返回 null。 */
+    String get(String key);
+
+    /** 删除，返回是否删除了一个现存（未过期）键。 */
+    boolean delete(String key);
+
+    /** 当前可观测指标。 */
+    Metrics metrics();
+
+    /** PUT 结果。 */
+    record PutResult(String key, long expireAtMs, boolean evicted, String evictedKey, int liveEntries) {
+    }
+
+    /** 容量与淘汰可观测指标。 */
+    record Metrics(int maxEntries, int liveEntries, long totalPutCount, long totalDeleteCount,
+                   long evictionCount, long expiredScanCount, long lastExpireAtMs, String state) {
+    }
+}
