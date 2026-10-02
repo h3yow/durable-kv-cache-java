@@ -2,7 +2,13 @@ package com.github.h3yow.durablekvcachejava.core;
 
 import com.github.h3yow.durablekvcachejava.cache.CacheExceptions.CapacityExceededException;
 import com.github.h3yow.durablekvcachejava.cache.CacheExceptions.InvalidRequestException;
+import com.github.h3yow.durablekvcachejava.cache.CacheExceptions.PersistenceException;
 import com.github.h3yow.durablekvcachejava.cache.CacheExceptions.StateConflictException;
+import com.github.h3yow.durablekvcachejava.cache.GroupAction;
+import com.github.h3yow.durablekvcachejava.cache.GroupIdConflictException;
+import com.github.h3yow.durablekvcachejava.cache.GroupMember;
+import com.github.h3yow.durablekvcachejava.cache.GroupResult;
+import com.github.h3yow.durablekvcachejava.cache.GroupStaleException;
 import com.github.h3yow.durablekvcachejava.cache.KeyValueCache;
 import com.github.h3yow.durablekvcachejava.config.CacheProperties;
 import com.github.h3yow.durablekvcachejava.eviction.EvictionTracker;
@@ -11,8 +17,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 单一锁串行化的持久化键值缓存状态机。
@@ -33,6 +43,8 @@ public final class DurableKvCache implements KeyValueCache {
     private final CacheProperties properties;
 
     private final Map<String, CacheEntry> store = new HashMap<>();
+    /** groupId -> 已确认提交的整组结论（用于重复提交幂等与冲突识别，恢复时从 WAL 重建）。 */
+    private final Map<String, StoredGroup> committedGroups = new HashMap<>();
     private long nextSeq;
     private boolean ready = false;
 
@@ -45,8 +57,19 @@ public final class DurableKvCache implements KeyValueCache {
         this.wal = wal;
         this.tracker = tracker;
         this.properties = properties;
-        this.nextSeq = wal.nextSeq();
+        // 序号的严格连续性由 RecoveryService 的帧感知重放负责校验（未闭合整组帧会先被截除）。
+        // 构造时只取最大序号 + 1 作为初始基线，随后由恢复流程按需重置，
+        // 不能在此用严格递增校验（崩溃截断后历史最大序号可能大于重放后的序号）。
+        this.nextSeq = walMaxSeq(wal);
         log.info("缓存状态机初始化: nextSeq={}, maxEntries={}", nextSeq, properties.getMaxEntries());
+    }
+
+    private static long walMaxSeq(PersistenceLog wal) {
+        long max = 0L;
+        for (var r : wal.readAll()) {
+            max = Math.max(max, r.seq());
+        }
+        return max + 1;
     }
 
     // ------------------------------------------------------------------ 对外操作
@@ -171,6 +194,370 @@ public final class DurableKvCache implements KeyValueCache {
     }
 
     @Override
+    public synchronized GroupResult commitGroup(String groupIdRaw, List<GroupMember> membersRaw) {
+        ensureReady();
+        String groupId = validateGroupRequest(groupIdRaw, membersRaw);
+        List<GroupMember> members = List.copyOf(membersRaw);
+        String signature = groupSignature(members);
+
+        // 1) 幂等/冲突：相同 groupId + 相同成员签名 -> 幂等返回；签名不同 -> 明确拒绝。
+        //    该判定先于任何状态检查，保证重复提交绝不叠加/覆盖。
+        StoredGroup existing = committedGroups.get(groupId);
+        if (existing != null) {
+            if (!existing.signature().equals(signature)) {
+                throw new GroupIdConflictException(groupId,
+                        "groupId=" + groupId + " 已成功提交过内容不同的整组操作，拒绝串组覆盖");
+            }
+            log.info("整组重复提交 group={} keys={} 依据=groupId与成员签名均一致 结果=幂等返回, 零副作用",
+                    groupId, memberKeys(members));
+            return existing.toDuplicateResult();
+        }
+
+        long now = System.currentTimeMillis();
+        // 2) 与单键 PUT/DELETE 完全一致：先按统一规则清理已过期键（过期键自然释放占用）。
+        purgeExpired(now);
+
+        // 3) 前置条件（读判定，零副作用）：INSERT 要求键不存在；UPDATE/DELETE 要求键存活。
+        List<String> staleKeys = new ArrayList<>();
+        List<String> staleReasons = new ArrayList<>();
+        for (GroupMember m : members) {
+            CacheEntry e = store.get(m.key());
+            if (m.action() == GroupAction.INSERT) {
+                if (e != null) {
+                    staleKeys.add(m.key());
+                    staleReasons.add(m.key() + "(INSERT目标已存在)");
+                }
+            } else if (e == null) {
+                staleKeys.add(m.key());
+                staleReasons.add(m.key() + "(" + (m.action() == GroupAction.UPDATE ? "UPDATE" : "DELETE")
+                        + "目标已过期或已删除)");
+            }
+        }
+        if (!staleKeys.isEmpty()) {
+            log.info("整组前置失败 group={} staleKeys={} 依据=提交时键状态不满足动作要求 结果=整组拒绝, 无WAL写入",
+                    groupId, staleReasons);
+            throw new GroupStaleException(groupId, staleKeys,
+                    "整组前置条件不满足，整组拒绝: " + String.join(", ", staleReasons));
+        }
+
+        // 4) 容量规划（只计算不落盘、不淘汰）：
+        //    本组最终必须存活的写入键 puts = INSERT+UPDATE；最终存活数 = live - 删除数 + 新增数。
+        int max = properties.getMaxEntries();
+        int deletes = 0;
+        int inserts = 0;
+        Set<String> memberKeys = new LinkedHashSet<>();
+        for (GroupMember m : members) {
+            memberKeys.add(m.key());
+            if (m.action() == GroupAction.DELETE) {
+                deletes++;
+            } else if (m.action() == GroupAction.INSERT) {
+                inserts++;
+            }
+        }
+        int puts = members.size() - deletes;
+        int liveAfterGroup = store.size() - deletes + inserts;
+        List<String> toEvict = new ArrayList<>();
+        if (max > 0) {
+            // 即使把其它所有非成员键全部淘汰，本组最终存活键也只有组内写入键 puts 个，
+            // 因此 puts > max 在数学上等价于"腾出全部位置也放不下"——下面分两种叙述拒绝：
+            // 没有任何可腾键（组自身即超限）与淘汰全部后仍差若干个位置。
+            if (puts > max) {
+                int nonMemberLive = store.size() - (members.size() - inserts); // 现存且非组成员的键数
+                int shortage = puts - max;
+                String reason = nonMemberLive == 0
+                        ? "整组写入键数 " + puts + " 超过容量上限 " + max
+                                + "，且没有任何其它键可供淘汰（整组自身即超限，至少还差 " + shortage + " 个位置）"
+                        : "整组提交后即使按 LRU 淘汰全部 " + nonMemberLive
+                                + " 个非成员键，仍差 " + shortage + " 个位置（容量上限 " + max + "）";
+                log.info("整组容量失败 group={} 依据=组内写入{}键, 非成员存活{}键, 仍差{}个 结果=整组拒绝, 无副作用",
+                        groupId, puts, nonMemberLive, shortage);
+                throw new CapacityExceededException("GROUP_TOO_LARGE", reason + "，整组拒绝");
+            }
+            int need = liveAfterGroup - max;
+            if (need > 0) {
+                // 候选项 = 当前存活且不属于本组的键（组内键无论写入/删除都不允许被淘汰），
+                // 严格按现有 LRU 从旧到新取 need 个；只规划，先不动内存。
+                for (String k : tracker.snapshotOldestFirst()) {
+                    if (toEvict.size() >= need) {
+                        break;
+                    }
+                    if (memberKeys.contains(k)) {
+                        continue;
+                    }
+                    CacheEntry e = store.get(k);
+                    if (e != null && now < e.expireAtMs()) {
+                        toEvict.add(k);
+                    }
+                }
+                if (toEvict.size() < need) {
+                    // 防御性分支：正常校验下 puts<=max 时该条件不成立；
+                    // 一旦出现（如未来引入受保护键），仍保证"不允许先淘汰一部分再失败"。
+                    log.info("整组容量失败 group={} 依据=需腾{}个位置但确定可淘汰非成员键仅{}个 结果=整组拒绝, 无副作用",
+                            groupId, need, toEvict.size());
+                    throw new CapacityExceededException("GROUP_TOO_LARGE",
+                            "整组提交后需 " + need + " 个空位，但按 LRU 仅能确定淘汰 "
+                                    + toEvict.size() + " 个非成员键，整组拒绝");
+                }
+            }
+        }
+
+        // 5) 持久化阶段：TXBEG,(EVICT*,成员*),TXEND 连续帧，每条 force；
+        //    记录文件起始长度，任一条失败就把本帧全部截断，序号回退，内存零改动。
+        long walLenBefore = wal.size();
+        long beginSeq = nextSeq;
+        try {
+            wal.append(new OperationRecord(nextSeq, OperationType.TXBEG, groupId,
+                    actionManifest(members), members.size(), now, groupId));
+            nextSeq++;
+            for (String k : toEvict) {
+                wal.append(new OperationRecord(nextSeq, OperationType.EVICT, k, null, 0L, now, groupId));
+                nextSeq++;
+            }
+            for (GroupMember m : members) {
+                OperationType t = m.action() == GroupAction.DELETE ? OperationType.DELETE : OperationType.PUT;
+                wal.append(new OperationRecord(nextSeq, t, m.key(),
+                        m.action() == GroupAction.DELETE ? null : m.value(),
+                        m.action() == GroupAction.DELETE ? 0L : m.ttlMillis(), now, groupId));
+                nextSeq++;
+            }
+            long endSeq = nextSeq;
+            wal.append(new OperationRecord(nextSeq, OperationType.TXEND, groupId, null,
+                    toEvict.size(), now, groupId));
+            nextSeq++;
+            // 6) 仅当整帧全部 force 成功后才提交内存：外部任何入口都不可能读到半成品。
+            applyGroupToMemory(members, toEvict, now);
+            GroupResult result = new GroupResult(groupId, true, false,
+                    classifyKeys(members, GroupAction.INSERT),
+                    classifyKeys(members, GroupAction.UPDATE),
+                    classifyKeys(members, GroupAction.DELETE),
+                    List.copyOf(toEvict), liveCount(), beginSeq, endSeq);
+            committedGroups.put(groupId, new StoredGroup(signature, result));
+            log.info("整组提交成功 group={} keys={} evicted={} seq={}..{} live={} 判定=整帧force成功后原子生效",
+                    groupId, memberKeys, toEvict, beginSeq, endSeq, result.liveEntries());
+            return result;
+        } catch (RuntimeException e) {
+            nextSeq = beginSeq; // 内存尚未改动，仅回退序号并截除本帧，保证"失败不留任何副作用"。
+            try {
+                wal.truncateTo(walLenBefore);
+            } catch (RuntimeException truncErr) {
+                log.error("整组失败后WAL截断也失败 group={} 截断至={}（重启恢复将丢弃未闭合帧）: {}",
+                        groupId, walLenBefore, truncErr.getMessage());
+            }
+            log.error("整组提交失败 group={} 依据=WAL追加异常 结果=整组拒绝, 内存与WAL均回滚: {}",
+                    groupId, e.getMessage());
+            if (e instanceof PersistenceException) {
+                throw e;
+            }
+            throw new PersistenceException("整组提交持久化失败 group=" + groupId, e);
+        }
+    }
+
+    @Override
+    public synchronized GroupResult groupStatus(String groupId) {
+        ensureReady();
+        validateGroupId(groupId);
+        StoredGroup g = committedGroups.get(groupId);
+        return g == null ? null : g.toResult();
+    }
+
+    @Override
+    public synchronized Map<String, String> snapshot() {
+        ensureReady();
+        long now = System.currentTimeMillis();
+        Map<String, String> snap = new HashMap<>();
+        for (Map.Entry<String, CacheEntry> en : store.entrySet()) {
+            if (now < en.getValue().expireAtMs()) {
+                snap.put(en.getKey(), en.getValue().value());
+            }
+        }
+        return snap;
+    }
+
+    /** 整帧落盘成功后：先淘汰、再按请求顺序应用成员，与单键规则复用同一套计数与 LRU 语义。 */
+    private void applyGroupToMemory(List<GroupMember> members, List<String> toEvict, long now) {
+        for (String k : toEvict) {
+            store.remove(k);
+            tracker.remove(k);
+            evictionCount++;
+        }
+        for (GroupMember m : members) {
+            if (m.action() == GroupAction.DELETE) {
+                if (store.remove(m.key()) != null) {
+                    tracker.remove(m.key());
+                    totalDeleteCount++;
+                }
+            } else {
+                store.put(m.key(), new CacheEntry(m.value(), now + m.ttlMillis()));
+                tracker.touch(m.key());
+                totalPutCount++;
+            }
+        }
+    }
+
+    private static List<String> classifyKeys(List<GroupMember> members, GroupAction action) {
+        List<String> keys = new ArrayList<>();
+        for (GroupMember m : members) {
+            if (m.action() == action) {
+                keys.add(m.key());
+            }
+        }
+        return List.copyOf(keys);
+    }
+
+    private static List<String> memberKeys(List<GroupMember> members) {
+        List<String> keys = new ArrayList<>();
+        for (GroupMember m : members) {
+            keys.add(m.key());
+        }
+        return List.copyOf(keys);
+    }
+
+    /** 成员签名：动作+键+TTL+值全部一致才视为同一提交（用于幂等与串组冲突识别）。 */
+    public static String groupSignature(List<GroupMember> members) {
+        StringBuilder sb = new StringBuilder();
+        for (GroupMember m : members) {
+            sb.append(m.action().name()).append(';')
+                    .append(m.key().length()).append(':').append(m.key()).append(';')
+                    .append(m.action() == GroupAction.DELETE ? "-" : m.ttlMillis()).append(';');
+            String v = m.action() == GroupAction.DELETE ? "" : m.value();
+            sb.append(v == null ? 0 : v.getBytes(StandardCharsets.UTF_8).length).append(':').append(v).append('\n');
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 组成员动作清单（持久化在 TXBEG 中）：恢复时无需依赖"键当时是否存在"推断动作，
+     * 即使该组所有键恢复时都已过期，也能准确重建 INSERT/UPDATE/DELETE 签名。
+     * 每个成员一段，段内以 {@code :} 分隔：{@code 动作首字母:键}:
+     * （I/U/D 分别代表 INSERT/UPDATE/DELETE）。
+     */
+    static String actionManifest(List<GroupMember> members) {
+        StringBuilder sb = new StringBuilder();
+        for (GroupMember m : members) {
+            sb.append(switch (m.action()) {
+                case INSERT -> 'I';
+                case UPDATE -> 'U';
+                case DELETE -> 'D';
+            }).append(':').append(m.key()).append('\n');
+        }
+        return sb.toString();
+    }
+
+    /** 解析动作清单为与成员顺序对应的动作列表。 */
+    public static List<GroupAction> parseActionManifest(String manifest, int expected) {
+        List<GroupAction> actions = new ArrayList<>();
+        if (manifest != null) {
+            for (String line : manifest.split("\n", -1)) {
+                if (line.isEmpty()) {
+                    continue;
+                }
+                actions.add(switch (line.charAt(0)) {
+                    case 'I' -> GroupAction.INSERT;
+                    case 'U' -> GroupAction.UPDATE;
+                    case 'D' -> GroupAction.DELETE;
+                    default -> throw new IllegalStateException("未知动作标记: " + line.charAt(0));
+                });
+            }
+        }
+        if (actions.size() != expected) {
+            throw new com.github.h3yow.durablekvcachejava.cache.CacheExceptions.RecoveryException(
+                    "TXBEG 动作清单数量(" + actions.size() + ")与成员数(" + expected + ")不一致");
+        }
+        return actions;
+    }
+
+    private String validateGroupRequest(String groupId, List<GroupMember> members) {
+        validateGroupId(groupId);
+        if (members == null || members.isEmpty()) {
+            throw new InvalidRequestException("整组提交的 members 不得为空");
+        }
+        Set<String> seen = new LinkedHashSet<>();
+        for (GroupMember m : members) {
+            if (m == null || m.action() == null) {
+                throw new InvalidRequestException("整组成员及其 action 不得为 null");
+            }
+            validateKey(m.key());
+            if (!seen.add(m.key())) {
+                throw new InvalidRequestException("整组提交内键重复出现: " + m.key());
+            }
+            if (m.action() == GroupAction.DELETE) {
+                continue;
+            }
+            if (m.value() == null) {
+                throw new InvalidRequestException("组成员 value 不得为 null（key=" + m.key() + "）");
+            }
+            int bytes = m.value().getBytes(StandardCharsets.UTF_8).length;
+            if (bytes > properties.getMaxValueBytes()) {
+                throw new InvalidRequestException(
+                        "组成员 value 超长: " + bytes + " > maxValueBytes=" + properties.getMaxValueBytes()
+                                + "（key=" + m.key() + "）");
+            }
+            if (m.ttlMillis() == null || m.ttlMillis() <= 0) {
+                throw new InvalidRequestException(
+                        "组成员 ttlMillis 必须为正数（key=" + m.key() + "），实际: " + m.ttlMillis());
+            }
+        }
+        return groupId;
+    }
+
+    private void validateGroupId(String groupId) {
+        if (groupId == null || groupId.isEmpty()) {
+            throw new InvalidRequestException("groupId 不得为空");
+        }
+        if (groupId.length() > properties.getMaxKeyLength()) {
+            throw new InvalidRequestException(
+                    "groupId 超长: " + groupId.length() + " > maxKeyLength=" + properties.getMaxKeyLength());
+        }
+    }
+
+    private int liveCount() {
+        long now = System.currentTimeMillis();
+        int live = 0;
+        for (CacheEntry e : store.values()) {
+            if (now < e.expireAtMs()) {
+                live++;
+            }
+        }
+        return live;
+    }
+
+    /** 恢复期登记一个已确认整组提交（由恢复服务按帧重放后调用）。 */
+    public synchronized void registerRecoveredGroup(StoredGroupRecord rec) {
+        if (ready) {
+            throw new StateConflictException("缓存已就绪，禁止补登记恢复组");
+        }
+        if (committedGroups.containsKey(rec.groupId())) {
+            throw new StateConflictException("WAL 中存在重复 groupId: " + rec.groupId());
+        }
+        GroupResult result = new GroupResult(rec.groupId(), true, false,
+                List.copyOf(rec.inserted()), List.copyOf(rec.updated()),
+                List.copyOf(rec.deleted()), List.copyOf(rec.evicted()),
+                liveCount(), rec.beginSeq(), rec.endSeq());
+        committedGroups.put(rec.groupId(), new StoredGroup(rec.signature(), result));
+        log.info("恢复登记整组 group={} keys={} evicted={} seq={}..{}",
+                rec.groupId(), result.insertedKeys(), rec.evicted(), rec.beginSeq(), rec.endSeq());
+    }
+
+    /** 恢复服务向状态机登记已确认整组提交所需的信息。 */
+    public record StoredGroupRecord(String groupId, String signature,
+                                    List<String> inserted, List<String> updated, List<String> deleted,
+                                    List<String> evicted, long beginSeq, long endSeq) {
+    }
+
+    /** 已确认提交组的内部存档（签名 + 结论）。 */
+    private record StoredGroup(String signature, GroupResult result) {
+        GroupResult toResult() {
+            return result;
+        }
+
+        GroupResult toDuplicateResult() {
+            return new GroupResult(result.groupId(), true, true,
+                    result.insertedKeys(), result.updatedKeys(), result.deletedKeys(),
+                    result.evictedKeys(), result.liveEntries(), result.beginSeq(), result.endSeq());
+        }
+    }
+
+    @Override
     public synchronized Metrics metrics() {
         ensureReady();
         long now = System.currentTimeMillis();
@@ -189,6 +576,14 @@ public final class DurableKvCache implements KeyValueCache {
 
     // ------------------------------------------------------------------ 恢复支持
 
+    /** 恢复重放前设置序号基线（未闭合整组帧被截除后，跳过其序号、永不复用）。 */
+    public synchronized void resetNextSeqForRecovery(long next) {
+        if (ready) {
+            throw new StateConflictException("缓存已就绪，禁止重置恢复序号");
+        }
+        nextSeq = next;
+    }
+
     /**
      * 恢复重放：不写 WAL、不改序号、不做容量淘汰，直接按日志全序重建内存。
      * 重复恢复由 Spring 只装配一次保证；对同一缓存二次调用会抛状态冲突，
@@ -199,6 +594,9 @@ public final class DurableKvCache implements KeyValueCache {
             throw new StateConflictException("缓存已就绪，禁止重复恢复以避免数据叠加");
         }
         switch (r.type()) {
+            case TXBEG, TXEND -> {
+                return RecoverySummary.txMarker();
+            }
             case PUT -> {
                 long expireAt = r.timestampMs() + r.ttlMillis();
                 if (now >= expireAt) {
@@ -334,7 +732,7 @@ public final class DurableKvCache implements KeyValueCache {
 
     /** 重放单条的分类计数。 */
     public record RecoverySummary(Kind kind) {
-        public enum Kind { PUT_NEW, PUT_OVERWRITE, DELETE_HIT, DELETE_MISS, EXPIRED_SKIP, EVICT_HIT }
+        public enum Kind { PUT_NEW, PUT_OVERWRITE, DELETE_HIT, DELETE_MISS, EXPIRED_SKIP, EVICT_HIT, TX_MARKER }
 
         static RecoverySummary putNew() {
             return new RecoverySummary(Kind.PUT_NEW);
@@ -358,6 +756,10 @@ public final class DurableKvCache implements KeyValueCache {
 
         static RecoverySummary evictHit() {
             return new RecoverySummary(Kind.EVICT_HIT);
+        }
+
+        static RecoverySummary txMarker() {
+            return new RecoverySummary(Kind.TX_MARKER);
         }
     }
 }

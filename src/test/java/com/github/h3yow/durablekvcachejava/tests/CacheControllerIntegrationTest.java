@@ -18,7 +18,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * HTTP 入口端到端：成功、过期、删除、容量与非法请求的错误码均可区分。
  * 使用独立 data 目录由 application-test.properties 指定，避免污染工作区。
  */
-@SpringBootTest(properties = "kv-cache.data-dir=target/it-data")
+@SpringBootTest(args = "--kv-cache.data-dir=target/it-data")
 @AutoConfigureMockMvc
 class CacheControllerIntegrationTest {
 

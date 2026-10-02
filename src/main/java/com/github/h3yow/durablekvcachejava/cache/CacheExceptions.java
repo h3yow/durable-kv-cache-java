@@ -17,8 +17,21 @@ public final class CacheExceptions {
 
     /** 容量超限且淘汰后仍无法容纳。 */
     public static final class CapacityExceededException extends RuntimeException {
+
+        /** 机器可判定原因：单键默认 {@code SINGLE_KEY_FULL}；整组为 {@code GROUP_TOO_LARGE} 等。 */
+        private final String reason;
+
         public CapacityExceededException(String message) {
+            this("SINGLE_KEY_FULL", message);
+        }
+
+        public CapacityExceededException(String reason, String message) {
             super(message);
+            this.reason = reason;
+        }
+
+        public String reason() {
+            return reason;
         }
     }
 

@@ -20,6 +20,9 @@ public interface EvictionTracker {
     /** 当前跟踪的键数量。 */
     int size();
 
+    /** 按 LRU 从旧到新返回键的快照（整组容量规划只读使用，不改变淘汰顺序）。 */
+    java.util.List<String> snapshotOldestFirst();
+
     /** 清空全部跟踪状态。 */
     void clear();
 }

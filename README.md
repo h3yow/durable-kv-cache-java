@@ -25,6 +25,8 @@ java -jar target/durable-kv-cache-java-1.0-SNAPSHOT.jar \
 | PUT | `/cache/keys/{key}?ttlMillis=<毫秒>` | 写入/重写，body 为**原始 UTF-8 文本值**（任意 Content-Type 均可） |
 | GET | `/cache/keys/{key}` | 读取；命中 200，不存在/已过期 404 |
 | DELETE | `/cache/keys/{key}` | 删除（幂等），`existed` 表示是否删除了现存键 |
+| POST | `/cache/groups/{groupId}/commit` | **整组原子提交**，body 为 JSON（见 §2.1） |
+| GET | `/cache/groups/{groupId}` | 查询某组的已确认提交结论；从未确认提交 404 |
 | GET | `/cache/admin/metrics` | 容量占用、淘汰数、过期清理数等可观测指标 |
 
 ```bash
@@ -34,15 +36,71 @@ curl -X DELETE "http://localhost:8080/cache/keys/user:1"
 curl "http://localhost:8080/cache/admin/metrics"
 ```
 
+### 2.1 整组提交（一组关联键要么全成、要么全不成）
+
+`POST /cache/groups/{groupId}/commit`，请求体：
+
+```json
+{
+  "members": [
+    {"key": "session:1:profile", "action": "INSERT", "value": "alice", "ttlMillis": 600000},
+    {"key": "session:1:perms",   "action": "UPDATE", "value": "admin", "ttlMillis": 600000},
+    {"key": "session:1:count",   "action": "DELETE"}
+  ]
+}
+```
+
+- `action` 三种，语义显式、判定结论可区分：
+  - `INSERT`：要求键当前**不存在**（未过期）。目标已存在 → 整组前置失败；
+  - `UPDATE`：要求键当前**存活**。已过期/已删除 → 整组前置失败；
+  - `DELETE`：要求键当前**存活**（整组失效场景）。已不存在 → 整组前置失败。
+- `groupId` 为调用方提供的非空幂等键（如业务流水号）：
+  - 相同 `groupId` + **完全相同**的成员（动作/键/值/TTL）重复提交 → 幂等返回
+    `status=OK_DUPLICATE`、`duplicate=true`，结果不叠加、不覆盖，重启后仍然识别；
+  - 相同 `groupId` 但成员不同 → `409 GROUP_ID_CONFLICT`，拒绝串组覆盖。
+- 成功响应明确列出每一类键与序号区间，便于本地核对：
+
+```json
+{
+  "status": "OK",
+  "groupId": "session-commit-0001",
+  "duplicate": false,
+  "insertedKeys": ["session:1:profile"],
+  "updatedKeys":  ["session:1:perms"],
+  "deletedKeys":  ["session:1:count"],
+  "evictedKeys":  ["old:key"],
+  "liveEntries": 3,
+  "seqRange": [12, 17]
+}
+```
+
+```bash
+curl -X POST "http://localhost:8080/cache/groups/session-commit-0001/commit" \
+     -H 'Content-Type: application/json' \
+     --data '{"members":[{"key":"a","action":"INSERT","value":"1","ttlMillis":600000},
+                         {"key":"b","action":"INSERT","value":"2","ttlMillis":600000}]}'
+curl "http://localhost:8080/cache/groups/session-commit-0001"
+```
+
 ### 错误响应（原因可区分）
 
 | HTTP | errorCode | 触发条件 |
 |---|---|---|
-| 400 | `INVALID_REQUEST` | 空键、null 值、缺 ttl、ttl<=0、值超长、键超长 |
+| 400 | `INVALID_REQUEST` | 空键、null 值、缺 ttl、ttl<=0、值超长、键超长；整组：空 groupId、空成员、组内键重复、非法 action |
+| 412 | `GROUP_MEMBER_STALE` | **仅整组**：提交时某个成员键已过期/已删除（UPDATE/DELETE 不命中）或 INSERT 目标已存在；响应带 `staleKeys`，**整组零副作用**，调用方可重读后重试 |
 | 409 | `STATE_CONFLICT` | 恢复未完成时访问、对同一实例重复恢复 |
-| 507 | `CAPACITY_EXCEEDED` | 容量满且无确定可淘汰键 |
-| 500 | `PERSISTENCE_FAILED` | WAL 追加/刷盘失败（本次写入整体失败，内存回滚） |
+| 409 | `GROUP_ID_CONFLICT` | **仅整组**：相同 groupId 提交了内容不同的成员 |
+| 507 | `CAPACITY_EXCEEDED` | 单键容量满且无确定可淘汰键；整组装不下（响应带 `reason=GROUP_TOO_LARGE`） |
+| 500 | `PERSISTENCE_FAILED` | WAL 追加/刷盘失败（本次操作整体失败，内存回滚） |
 | 503 | `RECOVERY_FAILED` | WAL 校验失败等恢复错误（正常流程中该错误发生在启动期，应用直接中止） |
+
+**调用方处理建议**：
+- `400`：请求本身有错，修正参数后重试，不要原样重放；
+- `412 GROUP_MEMBER_STALE`：组的前置假设已不成立（并发中被别人改/过期/删除），应**重新读取相关键的当前状态**，用新的 `groupId` 重新组包提交；本次调用没有留下任何副作用，可安全重试；
+- `409 GROUP_ID_CONFLICT`：`groupId` 被复用给了不同内容，属于调用方编程序号错误，必须更换 `groupId`；
+- `507`：容量问题。整组场景下**淘汰一个都不会发生**（规划阶段即拒绝），可在扩容或清理无关键后，用**同一个** `groupId` 原样重试（该组从未确认提交）；
+- `500`：本次写入未落盘成功，状态回滚到提交前；可用同一个 `groupId` 安全重试（服务端没有该组的确认记录）；
+- 只有拿到 `200`（含 `OK_DUPLICATE`）才代表这一组已经原子生效。
 
 ## 3. 过期语义
 
@@ -56,6 +114,10 @@ curl "http://localhost:8080/cache/admin/metrics"
 - 过期依据（`now`、`expireAt`）逐条打印到服务端日志。
 - 注意：这是单机墙钟语义；进程重启后，恢复重放同样用「当前时刻 vs 记录到期时间」判定，
   重启前已过期的键不会进入存活集。
+- 整组提交复用**完全相同**的过期规则：提交开始先统一扫描清理已过期键（过期键自然释放
+  容量占用），再对成员做前置判定。恢复时组成员 PUT 与单键 PUT 使用同一过期判定：
+  确认整组中恢复时刻已过期的键不进入存活集（组的"原子性"针对的是提交那一刻的成败，
+  到期后的键按 TTL 失效是既有语义的一部分，不会因为属于某个组而被续命）。
 
 ## 4. 并发与一致性模型
 
@@ -66,40 +128,76 @@ curl "http://localhost:8080/cache/admin/metrics"
 - WAL 失败时本次操作内存整体回滚（含被淘汰键恢复），调用方得到 500，绝不会出现
   「响应失败但数据已变」或「响应成功但未落盘」。
 
+### 4.1 整组提交的原子性与可见性
+
+- 一次整组提交在同一把监视器锁内完成「统一过期清理 → 前置校验 → **只读容量规划** →
+  整帧 WAL 落盘 → 内存一次提交」。锁不释放，因此提交期间任何其它入口（单键 GET/PUT/DELETE
+  或另一组提交）只能看到**这组操作之前的完整状态或之后的完整状态**，不可能读到改了一半。
+- 多组提交并发且键重叠时，它们按抢锁顺序形成**单一确定全序**：后提交的组整体覆盖先提交组
+  在重叠键上的值，不会出现互相覆盖到一半。整组的私有键与共享键的归属在任一时刻都自洽。
+- 容量规划是**纯只读**的：先确定需要淘汰哪些非成员键（严格按现有 LRU 顺序），
+  全部可行性确认后才进入落盘；规划本身不淘汰任何键、不消耗序号。
+- WAL 失败回滚：整帧记录被物理截断（`truncate` 回提交前长度），序号回退、内存零改动；
+  即使截断本身失败，重启恢复也会按未闭合帧丢弃同一区间，结论收敛一致。
+
 ## 5. 持久化与恢复保证
 
 ### WAL 格式
 
-文件 `data/cache.wal`，每条一行（UTF-8，`\n` 结尾）：
+文件 `data/cache.wal`，每条一行（UTF-8，`\n` 结尾）。当前为 **8 段**格式：
 
 ```
-seq|TYPE|key(base64)|value(base64)|ttl|timestamp|crc64
+seq|TYPE|key(base64)|value(base64)|ttl|timestamp|crc64|group(base64)
 ```
 
-- `TYPE` ∈ `PUT / DELETE / EVICT`；
-- `seq` 从 1 开始、严格连续递增；
+- `TYPE` ∈ `PUT / DELETE / EVICT / TXBEG / TXEND`；
+- `seq` 从 1 开始、在同一 WAL 上严格单调递增（崩溃截除未闭合整组后，被丢弃帧的序号
+  **永久跳过、不复用**，保证重放与新追加之间绝不撞号）；
+- 第 8 段 `group` 为整组提交的 `groupId`，单键记录为空；
+- **历史 7 段 WAL 行保持兼容**：旧文件按旧 FNV 校验和读取，重放语义不变；
+  新写入一律使用 8 段格式与扩展校验和（覆盖 group 段）；
 - 行尾附带 FNV-1a 64 位校验和，覆盖除校验字段外的全部内容。
 
 每次追加后执行 `FileChannel.force(true)`：**返回 200 的写入在 kill -9 后也不丢**。
 
+### 整组提交的 WAL 帧
+
+```
+TXBEG(groupId, 成员数N, 动作清单)   ← value 字段携带 INSERT/UPDATE/DELETE 动作清单
+EVICT ...                          ← 为容纳本组确定淘汰的键（0..M 条，先于成员落盘）
+PUT|DELETE ...  (N 条成员，按请求顺序，均带同一 groupId)
+TXEND(groupId, 淘汰数M)
+```
+
+- 只有读到匹配的 `TXEND` 的帧才是**确认提交**；
+- 恢复两遍扫描：第一遍定位并校验全部帧，末尾未闭合帧（`TXEND` 前崩溃，包括只写了半行的
+  页撕裂）判定为从未确认，**从 `TXBEG` 起始偏移整段截除并丢弃**——崩溃后第一次重启即
+  回到该组之前的完整状态，内存绝不重放半组；
+- 已闭合帧内的任何结构问题（groupId 不一致、动作清单/成员数/淘汰数不符、DELETE 成员
+  恢复时未命中存活键、CRC 失败）都作为 WAL 损坏抛 `RecoveryException`，**启动中止、拒绝对外
+  服务**，不会带着半套数据继续跑；
+- `TXBEG` 中持久化动作清单，使恢复即使遇到「提交时 UPDATE、恢复时键刚好过期」也能准确
+  重建幂等签名，不依赖提交瞬间的键是否存在来推断动作。
+
 ### 恢复流程（启动期，在 Web 服务对外可用之前完成）
 
 1. 顺序读取全部记录；末尾**无换行的半截行**被视为崩溃残留，可安全忽略并截除；
-2. 完整行必须通过字段数与 CRC 校验，否则抛 `RecoveryException`，Spring Bean 创建失败、
-   **启动中止（退出码非 0），绝不静默继续**；
-3. 校验序号严格连续（缺号/重复同样中止，错误信息可区分）；
+2. 完整行必须通过字段数与 CRC 校验（8 段新格式/7 段旧格式分别校验），否则抛
+   `RecoveryException`，Spring Bean 创建失败、**启动中止（退出码非 0），绝不静默继续**；
+3. 校验序号单调递增、组帧结构合法（见上）；未闭合整组整段截除；
 4. 按全序重放：`PUT` 覆盖（重复提交不叠加计数）、`DELETE`/`EVICT` 移除；
-   恢复时刻已过期的 PUT 记为 `EXPIRED_SKIP` 且不进入存活集；
+   恢复时刻已过期的 PUT 记为 `EXPIRED_SKIP` 且不进入存活集；整组以闭合帧为单位原子应用；
 5. 全部成功后才 `markReady`；此前任何业务请求都得到 `409 STATE_CONFLICT`，
    **不暴露半初始化数据**；
-6. 对同一缓存实例重复恢复会被拒绝（`STATE_CONFLICT`），防止内存叠加。
+6. 对同一缓存实例重复恢复会被拒绝（`STATE_CONFLICT`），防止内存叠加；
+7. 已确认整组的 `groupId → (成员签名, 结论)` 在恢复后重建登记：重复提交相同组仍幂等，
+   不同内容仍冲突，结论不因重启丢失或叠加。
 
 `EVICT` 也要持久化：容量淘汰是状态机全序的一部分，否则重启后被淘汰键会因历史 PUT
-「复活」。WAL 追加失败导致淘汰已落盘而新 PUT 回滚时，会追加一条幂等 EVICT 补偿记录，
-使 WAL 与内存重新一致。
+「复活」。组帧内的 EVICT 与单键 EVICT 共用同一恢复规则（淘汰计数跨重启连续）。
 
-恢复摘要（重放条数、PUT/DELETE/EVICT 计数、过期跳过数、最终 seq、存活键数）
-打印在启动日志中。
+恢复摘要（重放条数、PUT/DELETE/EVICT 计数、过期跳过数、最终 seq、存活键数、
+**恢复整组数、丢弃未闭合整组数**）打印在启动日志中。
 
 ## 6. 容量与淘汰规则
 
@@ -112,6 +210,29 @@ seq|TYPE|key(base64)|value(base64)|ttl|timestamp|crc64
   `evictionCount`，重启恢复后该计数保持连续。
 - 指标字段：`maxEntries, liveEntries, totalPutCount, totalDeleteCount, evictionCount,
   expiredScanCount, lastExpireAtMs, state(READY/RECOVERING)`。
+
+### 6.1 整组提交的容量规则（先规划、后淘汰；不允许先淘汰再失败）
+
+设组内写入成员数（INSERT+UPDATE）为 `puts`，删除成员数为 `deletes`，新增数为
+`inserts`（仅 INSERT），容量上限为 `M`：
+
+1. **整组自身即超限**：`puts > M` 且没有任何非成员键可腾时，直接拒绝
+   （消息中明确「没有任何其它键可供淘汰」）；
+2. **腾出全部位置仍不够**：`puts > M` 且存在非成员键时，消息明确「即使淘汰全部 N 个
+   非成员键，仍差 X 个位置」；
+3. 否则计算提交后存活数 `liveAfter = 当前存活 - deletes + inserts`：
+   - `liveAfter <= M`：不需要淘汰，直接成功；
+   - 否则需要 `need = liveAfter - M` 个空位，按当前 LRU 从旧到新选取**非成员存活键**
+     （组成员键无论将被写入还是删除，都绝不允许作为腾位对象被淘汰）。
+4. 以上任一拒绝结论都发生在落盘之前：**不写任何 WAL、不淘汰任何键、不消耗序号**，
+   响应 507 且 `reason=GROUP_TOO_LARGE`，响应消息区分上述两种原因。
+5. 成功时响应的 `evictedKeys` 明确给出被淘汰的键（确定顺序）；EVICT 记录先于成员
+   操作在同一组帧内落盘，淘汰结论随整组一起跨重启保持。
+
+边界示例（`M=3`，当前已满 `old1,old2,old3`）：
+- 组 = `DELETE old3` + `INSERT n1`：删除释放 1 位，刚好放下，无淘汰；
+- 组 = `UPDATE old1` + `INSERT n1,n2,n3`：组写入 4 键 > 3，即使淘汰非成员
+  `old2,old3` 仍差 1 位 → 整组拒绝，三个旧键一个都不会被先淘汰。
 
 ### 配置项（均可通过同名环境变量覆盖）
 
@@ -130,20 +251,79 @@ seq|TYPE|key(base64)|value(base64)|ttl|timestamp|crc64
 mvn test
 ```
 
-22 个测试全部本地运行（WAL 均落在 JUnit `@TempDir`），不依赖外部服务：
+43 个测试全部本地运行（WAL 均落在 JUnit `@TempDir`；Spring 上下文测试用命令行参数
+`--kv-cache.data-dir` 指向各自独立目录），不依赖外部服务：
 
 | 测试类 | 覆盖内容 |
 |---|---|
-| `FileWalLogTest` | WAL 往返、崩溃半行截断、CRC 损坏可区分失败、序号递增 |
+| `FileWalLogTest` | WAL 往返（8 段新格式/7 段旧格式兼容）、崩溃半行截断、CRC 损坏可区分失败、序号递增 |
 | `DurableKvCacheTest` | 读写删、TTL 过期、确定 LRU 淘汰、非法请求 4 类原因、未就绪访问拒绝、16 线程并发读重写、过期/重写/删除竞争（8 组）、指标 |
+| `GroupCommitTest` | 整组原子生效、UPDATE/DELETE 混合、前置失败零副作用（已过期/已删除/INSERT 冲突）、重启前后幂等、groupId 串组冲突、参数错误、容量刚好放下/差一个/整组大于上限/删除释放容量且不误淘汰成员 |
+| `GroupConcurrencyTest` | 两组（键在 c 上重叠）12 写线程 + 4 快照读线程高并发：半组可见态为 0，最终为单一确定全序 |
+| `GroupRecoveryTest` | 已确认整组完整恢复、TXEND 前崩溃首次重启即整段丢弃（无半组）、半行撕裂同样丢弃、损坏闭合帧 CRC 中止、组淘汰结论跨重启、连续 3 次冷启动不叠加 |
+| `GroupControllerIntegrationTest` | HTTP 200/OK_DUPLICATE/412/409/507/400 错误码可区分、组状态 404（独立目录 `target/it-group-data`） |
 | `RecoveryTest` | kill 后重放（重写/删除/过期/删后重写）、淘汰结论跨重启保持、重复恢复拒绝、WAL 损坏中止、崩溃残留容忍 |
-| `CacheControllerIntegrationTest` | HTTP 成功/404/400 错误码、metrics 端点 |
-| `ProcessRestartSimulationTest` | 真实关闭并重建整个 Spring 上下文，验证已确认写入与删除跨「进程」保持 |
+| `CacheControllerIntegrationTest` | HTTP 成功/404/400 错误码、metrics 端点（独立目录 `target/it-data`） |
+| `ProcessRestartSimulationTest` | 真实关闭并重建整个 Spring 上下文（每用例独立子目录、每上下文唯一）：单键与整组跨「进程」保持、整组不半组、跨进程重复提交幂等 |
 
-单测日志中打印了**键、判定依据（now/expireAt、LRU 位置、序号、错误原因）与恢复结果**，
+单测日志中打印了**操作的是哪一组（groupId）、涉及哪些键、判定依据（now/expireAt、
+LRU 位置、动作清单、序号区间、错误原因）与恢复结果（整组恢复数/未闭合帧丢弃数）**，
 可在 `target/surefire-reports/` 或控制台查看。
 
-### 手工复现崩溃恢复
+### 手工复现整组原子性与崩溃恢复
+
+```bash
+mvn package -DskipTests
+rm -rf /tmp/kvg && java -jar target/durable-kv-cache-java-1.0-SNAPSHOT.jar \
+    --server.port=8086 --kv-cache.data-dir=/tmp/kvg --kv-cache.max-entries=3 &
+B=http://localhost:8086/cache
+
+# 1) 三个旧键填满容量；GET 刷新 old3，使 old1 成为 LRU 最旧
+for k in old1 old2 old3; do
+  curl -s -X PUT "$B/keys/$k?ttlMillis=600000" --data-binary "$k" >/dev/null
+done
+curl -s "$B/keys/old3" >/dev/null
+
+# 2) 整组提交：UPDATE old3 + 两个 INSERT。puts=3 恰好 <= 上限 3，
+#    liveAfter=3-0+2=5 -> need=2，LRU 淘汰非成员 old1,old2 后刚好 live=3
+curl -s -X POST "$B/groups/demo-session-1/commit" -H 'Content-Type: application/json' --data '{
+  "members":[
+    {"key":"old3","action":"UPDATE","value":"old3v2","ttlMillis":600000},
+    {"key":"new1","action":"INSERT","value":"n1","ttlMillis":600000},
+    {"key":"new2","action":"INSERT","value":"n2","ttlMillis":600000}
+  ]}'
+# -> evictedKeys=["old1","old2"], liveEntries=3, seqRange 可见
+
+# 3) 前置失败演示：UPDATE 一个不存在的键 -> 412，且组内其它键不受影响
+curl -i -X POST "$B/groups/demo-stale/commit" -H 'Content-Type: application/json' --data '{
+  "members":[{"key":"ghost","action":"UPDATE","value":"x","ttlMillis":600000}]}'
+
+# 4) 幂等：相同 groupId + 相同成员再提一次 -> 200 status=OK_DUPLICATE
+curl -s -X POST "$B/groups/demo-session-1/commit" -H 'Content-Type: application/json' --data '{
+  "members":[
+    {"key":"old3","action":"UPDATE","value":"old3v2","ttlMillis":600000},
+    {"key":"new1","action":"INSERT","value":"n1","ttlMillis":600000},
+    {"key":"new2","action":"INSERT","value":"n2","ttlMillis":600000}
+  ]}' | head -c 300
+
+# 5) kill -9 后重启：整组结论完整恢复（old1/old2 不复活，old3/new1/new2 存活）
+kill -9 $(ss -ltnp | grep 8086 | grep -oP 'pid=\K[0-9]+')
+java -jar target/durable-kv-cache-java-1.0-SNAPSHOT.jar \
+    --server.port=8086 --kv-cache.data-dir=/tmp/kvg --kv-cache.max-entries=3 &
+sleep 2
+curl -s "$B/groups/demo-session-1"          # 组结论可查
+curl -s "$B/keys/old1"                      # 404（组淘汰结论跨重启保持）
+curl -s "$B/keys/old3"                      # 200 old3v2
+curl -s "$B/admin/metrics"                  # evictionCount=2, liveEntries=3 接得上
+```
+
+模拟「提交中被强杀」（无 TXEND 的半组）：停服后手工在 `cache.wal` 末尾追加带某个
+groupId 的 `TXBEG`+部分成员行（**不要**加 TXEND，也可最后一行不加换行模拟页撕裂），
+再启动；观察启动/恢复日志中「恢复丢弃未闭合整组」——WAL 从该帧 TXBEG 偏移整段截除，
+对外服务恢复到该组之前的完整状态，不出现半组。该场景的自动化版本见
+`GroupRecoveryTest.crashBeforeTxEndDiscardsWholeGroupOnFirstRestart`。
+
+### 手工复现崩溃恢复（单键）
 
 ```bash
 mvn package -DskipTests
@@ -163,11 +343,12 @@ curl "$B/keys/a"   # 200 alpha；curl "$B/keys/b" # 404：淘汰结论跨重启�
 ## 8. 代码结构
 
 ```
-core/        CacheEntry / OperationRecord / OperationType / DurableKvCache(状态机)
-persistence/ PersistenceLog 接口、FileWalLog(force + CRC + 截断修复)
-eviction/    EvictionTracker 接口、LruEvictionTracker(access-order LRU)
-cache/       KeyValueCache 接口、CacheExceptions(可区分异常层次)
-recovery/    RecoveryService(全序重放)、RecoveryRunner(启动确认)
+core/        CacheEntry / OperationRecord / OperationType(TXBEG/TXEND) / DurableKvCache(状态机,含整组提交)
+cache/       KeyValueCache 接口、GroupAction/GroupMember/GroupResult、CacheExceptions、
+             GroupStaleException(412) / GroupIdConflictException(409)
+persistence/ PersistenceLog 接口、WalEntry(偏移)、FileWalLog(8段格式+7段兼容+截断)
+eviction/    EvictionTracker 接口、LruEvictionTracker(access-order LRU, 只读快照)
+recovery/    RecoveryService(两遍帧感知重放/未闭合帧截除)、RecoveryRunner(启动确认)
 config/      CacheProperties(配置校验)、CacheBeans(恢复屏障式装配)、CachedBodyFilter
-web/         CacheController、GlobalExceptionHandler、CachedBodyFilter
+web/         CacheController(单键+整组端点)、GlobalExceptionHandler、dto/GroupCommitRequest、CachedBodyFilter
 ```

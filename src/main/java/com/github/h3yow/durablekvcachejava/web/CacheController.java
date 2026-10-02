@@ -1,14 +1,20 @@
 package com.github.h3yow.durablekvcachejava.web;
 
+import com.github.h3yow.durablekvcachejava.cache.GroupAction;
+import com.github.h3yow.durablekvcachejava.cache.GroupMember;
+import com.github.h3yow.durablekvcachejava.cache.GroupResult;
 import com.github.h3yow.durablekvcachejava.cache.KeyValueCache;
 import com.github.h3yow.durablekvcachejava.cache.KeyValueCache.PutResult;
+import com.github.h3yow.durablekvcachejava.web.dto.GroupCommitRequest;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -16,7 +22,9 @@ import org.springframework.web.bind.annotation.RestController;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -93,5 +101,65 @@ public class CacheController {
     @GetMapping("/admin/metrics")
     public KeyValueCache.Metrics metrics() {
         return cache.metrics();
+    }
+
+    /**
+     * 整组原子提交：POST /cache/groups/{groupId}/commit。
+     * 组内成员全部生效或全部不生效；相同 groupId + 相同成员的重复提交幂等。
+     * 成功 200；参数错误 400；前置不满足（键已过期/已删除/INSERT 已存在）412；
+     * groupId 串组冲突 409；容量装不下 507；持久化失败 500。
+     */
+    @PostMapping("/groups/{groupId}/commit")
+    public ResponseEntity<Map<String, Object>> commitGroup(@PathVariable String groupId,
+                                                           @RequestBody GroupCommitRequest body) {
+        List<GroupMember> members = new ArrayList<>();
+        if (body == null || body.getMembers() == null) {
+            members = List.of(); // 交给状态机按"members 不得为空"明确拒绝
+        } else {
+            for (GroupCommitRequest.Member m : body.getMembers()) {
+                GroupAction action;
+                try {
+                    action = GroupAction.valueOf(m.getAction());
+                } catch (Exception e) {
+                    throw new com.github.h3yow.durablekvcachejava.cache.CacheExceptions
+                            .InvalidRequestException("非法 action: " + m.getAction()
+                            + "（允许 INSERT/UPDATE/DELETE，key=" + m.getKey() + "）");
+                }
+                members.add(new GroupMember(m.getKey(), action, m.getValue(), m.getTtlMillis()));
+            }
+        }
+        GroupResult result = cache.commitGroup(groupId, members);
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("status", result.duplicate() ? "OK_DUPLICATE" : "OK");
+        resp.put("groupId", result.groupId());
+        resp.put("duplicate", result.duplicate());
+        resp.put("insertedKeys", result.insertedKeys());
+        resp.put("updatedKeys", result.updatedKeys());
+        resp.put("deletedKeys", result.deletedKeys());
+        resp.put("evictedKeys", result.evictedKeys());
+        resp.put("liveEntries", result.liveEntries());
+        resp.put("seqRange", List.of(result.beginSeq(), result.endSeq()));
+        return ResponseEntity.ok(resp);
+    }
+
+    /** 查询某个 groupId 的已确认提交结论；从未确认提交 404。 */
+    @GetMapping("/groups/{groupId}")
+    public ResponseEntity<Map<String, Object>> groupStatus(@PathVariable String groupId) {
+        GroupResult result = cache.groupStatus(groupId);
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("groupId", groupId);
+        if (result == null) {
+            resp.put("status", "NOT_FOUND");
+            resp.put("reason", "该 groupId 从未确认提交成功（或提交中途失败被整组回滚）");
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(resp);
+        }
+        resp.put("status", "OK");
+        resp.put("insertedKeys", result.insertedKeys());
+        resp.put("updatedKeys", result.updatedKeys());
+        resp.put("deletedKeys", result.deletedKeys());
+        resp.put("evictedKeys", result.evictedKeys());
+        resp.put("liveEntries", result.liveEntries());
+        resp.put("seqRange", List.of(result.beginSeq(), result.endSeq()));
+        return ResponseEntity.ok(resp);
     }
 }
