@@ -83,6 +83,61 @@ class FileWalLogTest {
     }
 
     @Test
+    void committedGroupFramesRoundTripAndUncommittedGroupIsTrimmed() throws IOException {
+        FileWalLog wal = new FileWalLog(tempDir.toString(), "g.wal");
+        wal.append(new OperationRecord(1, OperationType.PUT, "solo", "s", 5000L, 100L));
+        wal.append(OperationRecord.frame(2, OperationType.GBEGIN, "g1", 2, 200L));
+        wal.append(new OperationRecord(3, OperationType.PUT, "a", "1", 5000L, 200L, "g1"));
+        wal.append(new OperationRecord(4, OperationType.DELETE, "solo", null, 0L, 200L, "g1"));
+        wal.append(OperationRecord.frame(5, OperationType.GCOMMIT, "g1", 0, 200L));
+
+        List<OperationRecord> all = new ArrayList<>();
+        wal.readAll().forEach(all::add);
+        assertEquals(5, all.size(), "GBEGIN/GCOMMIT 也占用序号并被读回");
+        assertEquals(OperationType.GBEGIN, all.get(1).type());
+        assertEquals("g1", all.get(1).groupId());
+        assertEquals(OperationType.GCOMMIT, all.get(4).type());
+        assertEquals(6L, wal.nextSeq());
+
+        // 强杀残留：未闭合整组（GBEGIN + 1 成员 + 无换行半行）必须整体截除到最后提交点 seq=5。
+        wal.append(OperationRecord.frame(6, OperationType.GBEGIN, "g2", 1, 300L));
+        wal.close();
+        Files.writeString(Path.of(tempDir.toString(), "g.wal"),
+                "7|PUT|" + java.util.Base64.getEncoder().encodeToString("z".getBytes())
+                        + "|" + java.util.Base64.getEncoder().encodeToString("9".getBytes())
+                        + "|5000|300|" + java.util.Base64.getEncoder().encodeToString("g2".getBytes()),
+                java.nio.file.StandardOpenOption.APPEND);
+
+        FileWalLog wal2 = new FileWalLog(tempDir.toString(), "g.wal");
+        List<OperationRecord> after = new ArrayList<>();
+        wal2.readAll().forEach(after::add);
+        assertEquals(5, after.size(), "未闭合整组（含 GBEGIN）必须被整体截除");
+        assertEquals(6L, wal2.nextSeq(), "下一个序号必须接在已提交的 GCOMMIT 之后");
+        String content = Files.readString(Path.of(tempDir.toString(), "g.wal"), StandardCharsets.UTF_8);
+        assertTrue(content.endsWith("\n") && !content.contains("g2"), "未闭合组必须被物理截除");
+        log.info("WAL整组判定 组=g1(闭合往返)/g2(强杀未提交) 依据=帧占序号+无GCOMMIT整段截除 恢复结果=6条,nextSeq=6");
+    }
+
+    @Test
+    void orphanFrameRecordOutsideGroupFailsRecovery() throws IOException {
+        FileWalLog wal = new FileWalLog(tempDir.toString(), "orphan.wal");
+        wal.append(new OperationRecord(1, OperationType.PUT, "a", "1", 5000L, 100L));
+        wal.close();
+        // 直接构造一条 CRC 合法但"带 groupId 且不在帧内"的完整记录（8 段，末段为 CRC）。
+        String gidB64 = java.util.Base64.getEncoder().encodeToString("gx".getBytes());
+        long crc = FileWalLog.checksum(new OperationRecord(2, OperationType.PUT, "b", "2", 5000L, 200L, "gx"));
+        String line = "2|PUT|" + java.util.Base64.getEncoder().encodeToString("b".getBytes())
+                + "|" + java.util.Base64.getEncoder().encodeToString("2".getBytes())
+                + "|5000|200|" + gidB64 + "|" + crc + "\n";
+        Files.writeString(Path.of(tempDir.toString(), "orphan.wal"), line,
+                java.nio.file.StandardOpenOption.APPEND);
+        FileWalLog wal2 = new FileWalLog(tempDir.toString(), "orphan.wal");
+        RecoveryException ex = assertThrows(RecoveryException.class, wal2::readAll);
+        assertTrue(ex.getMessage().contains("GBEGIN"), "必须明确是帧结构错误: " + ex.getMessage());
+        log.info("WAL孤儿成员判定 groupId=gx 依据=有groupId无帧 恢复结果={}", ex.getMessage());
+    }
+
+    @Test
     void nonStrictSequenceFailsRecovery() {
         FileWalLog wal = new FileWalLog(tempDir.toString(), "c.wal");
         wal.append(new OperationRecord(1, OperationType.PUT, "k1", "v1", 5000L, 100L));

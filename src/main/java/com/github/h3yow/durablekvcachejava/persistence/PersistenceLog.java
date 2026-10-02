@@ -16,6 +16,15 @@ public interface PersistenceLog {
     /** 当前已分配的下一个序号。 */
     long nextSeq();
 
+    /**
+     * 将日志截断到给定字节长度并强制刷盘，用于整组提交中途失败时回滚尚未提交的帧，
+     * 使 WAL 立即回到"最后一个完整提交点"。
+     */
+    void truncateTo(long byteSize);
+
+    /** 当前 WAL 文件字节数（整组提交前记录"提交点"用）。 */
+    long sizeBytes();
+
     /** 关闭底层资源。 */
     void close();
 }

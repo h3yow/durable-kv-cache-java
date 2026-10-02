@@ -1,7 +1,10 @@
 package com.github.h3yow.durablekvcachejava.core;
 
 import com.github.h3yow.durablekvcachejava.cache.CacheExceptions.CapacityExceededException;
+import com.github.h3yow.durablekvcachejava.cache.CacheExceptions.GroupCapacityException;
+import com.github.h3yow.durablekvcachejava.cache.CacheExceptions.GroupStaleException;
 import com.github.h3yow.durablekvcachejava.cache.CacheExceptions.InvalidRequestException;
+import com.github.h3yow.durablekvcachejava.cache.CacheExceptions.RecoveryException;
 import com.github.h3yow.durablekvcachejava.cache.CacheExceptions.StateConflictException;
 import com.github.h3yow.durablekvcachejava.cache.KeyValueCache;
 import com.github.h3yow.durablekvcachejava.config.CacheProperties;
@@ -11,7 +14,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -33,6 +38,8 @@ public final class DurableKvCache implements KeyValueCache {
     private final CacheProperties properties;
 
     private final Map<String, CacheEntry> store = new HashMap<>();
+    /** 已确认提交的整组：groupId -> 提交时的成员操作（用于重试去重与恢复后判定）。 */
+    private final Map<String, CommittedGroup> committedGroups = new HashMap<>();
     private long nextSeq;
     private boolean ready = false;
 
@@ -40,6 +47,11 @@ public final class DurableKvCache implements KeyValueCache {
     private long totalDeleteCount;
     private long evictionCount;
     private long expiredScanCount;
+    private long groupCommitCount;
+    private long groupSuccessCount;
+    private long groupRejectedStaleCount;
+    private long groupRejectedCapacityCount;
+    private long groupDuplicateCount;
 
     public DurableKvCache(PersistenceLog wal, EvictionTracker tracker, CacheProperties properties) {
         this.wal = wal;
@@ -171,6 +183,253 @@ public final class DurableKvCache implements KeyValueCache {
     }
 
     @Override
+    public synchronized GroupCommitResult commitGroup(String groupId, List<GroupOperation> members) {
+        ensureReady();
+        long now = System.currentTimeMillis();
+
+        // ------------------------------------------------ 1. 参数与幂等校验（无副作用）
+        validateGroupRequest(members);
+        String gid = groupId == null ? "g-" + java.util.UUID.randomUUID() : groupId;
+        validateGroupId(gid);
+        for (GroupOperation m : members) {
+            validateKey(m.key());
+            if (m.op() == OperationType.PUT) {
+                validatePut(m.key(), m.value(), m.ttlMillis());
+            } else if (m.op() != OperationType.DELETE) {
+                throw new InvalidRequestException("不支持的整组成员操作类型: " + m.op());
+            }
+        }
+        // 同一组内键不允许重复：否则组内自身顺序就会产生歧义。
+        java.util.Set<String> duplicateGuard = new java.util.HashSet<>();
+        for (GroupOperation m : members) {
+            if (!duplicateGuard.add(m.key())) {
+                throw new InvalidRequestException(
+                        "整组内键重复: key=" + m.key() + "（同一组中每个键只能出现一次）");
+            }
+        }
+
+        CommittedGroup previous = committedGroups.get(gid);
+        if (previous != null) {
+            // 重试去重：同 groupId 同内容直接返回历史结论，绝不叠加执行；
+            // 同 groupId 不同内容则按参数错误明确拒绝。
+            if (!previous.spec().equals(members)) {
+                groupCommitCount++;
+                throw new InvalidRequestException(
+                        "groupId=" + gid + " 已被其它整组使用，成员内容与本次提交不一致（拒绝复用）");
+            }
+            groupCommitCount++;
+            groupDuplicateCount++;
+            log.info("整组重复提交判定 groupId={} 依据=相同成员已提交 结果=DUPLICATE beginSeq={} commitSeq={}",
+                    gid, previous.beginSeq(), previous.commitSeq());
+            return new GroupCommitResult(gid, GroupCommitResult.Outcome.DUPLICATE, members.size(),
+                    previous.evictedKeys(), previous.beginSeq(), previous.commitSeq(), liveCountLocked());
+        }
+
+        // ------------------------------------------------ 2. 前置状态判定（先于任何变更）
+        // 组内 DELETE 的键必须在提交时刻仍然存活；已过期/已删除都要能区分，且整组拒绝、零副作用。
+        List<GroupStaleException.StaleKey> stale = new ArrayList<>();
+        for (GroupOperation m : members) {
+            if (m.op() != OperationType.DELETE) {
+                continue;
+            }
+            CacheEntry e = store.get(m.key());
+            if (e == null) {
+                stale.add(GroupStaleException.StaleKey.deleted(m.key()));
+            } else if (now >= e.expireAtMs()) {
+                stale.add(GroupStaleException.StaleKey.expired(m.key()));
+            }
+        }
+        if (!stale.isEmpty()) {
+            groupCommitCount++;
+            groupRejectedStaleCount++;
+            log.info("整组拒绝 groupId={} 依据=成员前置状态不满足 stale={} 结果=GROUP_STALE(零副作用)",
+                    gid, stale);
+            throw new GroupStaleException(gid, List.copyOf(stale));
+        }
+
+        // 复用单键入口的过期规则：顺手清理与本组无关的已过期键。
+        purgeExpired(now);
+
+        java.util.Set<String> deleteKeys = new java.util.HashSet<>();
+        java.util.Set<String> putKeys = new java.util.HashSet<>();
+        for (GroupOperation m : members) {
+            (m.op() == OperationType.PUT ? putKeys : deleteKeys).add(m.key());
+        }
+        // 新增加的键 = PUT 成员中当前不存活的键（过期键已在上面被清理，同样算新增）。
+        int newKeyCount = 0;
+        for (String k : putKeys) {
+            if (!store.containsKey(k)) {
+                newKeyCount++;
+            }
+        }
+        int deleteHitCount = 0;
+        for (String k : deleteKeys) {
+            if (store.containsKey(k)) {
+                deleteHitCount++;
+            }
+        }
+        int projectedLive = store.size() - deleteHitCount + newKeyCount;
+
+        // ------------------------------------------------ 3. 容量预演（只预演，不动内存）
+        List<String> evictionPlan = new ArrayList<>();
+        if (properties.getMaxEntries() > 0) {
+            if (putKeys.size() > properties.getMaxEntries()) {
+                // 整组自身最终占用就超过上限：即使清空缓存也放不下，直接拒绝。
+                groupCommitCount++;
+                groupRejectedCapacityCount++;
+                String msg = "整组超过容量上限: groupId=" + gid + " 整组最终键数=" + putKeys.size()
+                        + " > maxEntries=" + properties.getMaxEntries()
+                        + "（整组拒绝，未淘汰任何键）";
+                log.info("整组容量判定 groupId={} 依据=GROUP_TOO_LARGE 结果=拒绝 {}", gid, msg);
+                throw new GroupCapacityException(gid, "GROUP_TOO_LARGE", msg);
+            }
+            int need = projectedLive - properties.getMaxEntries();
+            if (need > 0) {
+                // 严格复用现有 LRU 顺序：从旧到新挑选"不会被本组删除/重写"的存活键。
+                for (String candidate : tracker.peekOldestFirst()) {
+                    if (evictionPlan.size() >= need) {
+                        break;
+                    }
+                    if (deleteKeys.contains(candidate) || putKeys.contains(candidate)) {
+                        continue;
+                    }
+                    evictionPlan.add(candidate);
+                }
+                if (evictionPlan.size() < need) {
+                    // 腾不出足够空间：整组拒绝。此前只做了只读预演，没有任何键被真正淘汰。
+                    groupCommitCount++;
+                    groupRejectedCapacityCount++;
+                    String msg = "整组容量不足且无法腾出足够空间: groupId=" + gid
+                            + " 需要淘汰=" + need + " 可按LRU淘汰=" + evictionPlan.size()
+                            + "（整组拒绝，未淘汰任何键）";
+                    log.info("整组容量判定 groupId={} 依据=GROUP_INSUFFICIENT_SPACE 结果=拒绝 {}", gid, msg);
+                    throw new GroupCapacityException(gid, "GROUP_INSUFFICIENT_SPACE", msg);
+                }
+            }
+        }
+
+        // ------------------------------------------------ 4. 先落盘整组（GBEGIN/成员/EVICT/GCOMMIT）
+        // 记录提交点字节偏移：中途任何失败都把 WAL 截回此处，磁盘上绝不残留半成品组。
+        long commitPoint = wal.sizeBytes();
+        long beginSeq = nextSeq;
+        long seqCursor = nextSeq;
+        try {
+            int framedRecords = evictionPlan.size() + members.size();
+            wal.append(OperationRecord.frame(seqCursor, OperationType.GBEGIN,
+                    gid, framedRecords, now));
+            seqCursor++;
+            // 淘汰记录先于成员操作，且同属一个原子组：淘汰结论随整组一起生效或一起消失。
+            for (String evictedKey : evictionPlan) {
+                wal.append(new OperationRecord(seqCursor, OperationType.EVICT,
+                        evictedKey, null, 0L, now, gid));
+                seqCursor++;
+            }
+            for (GroupOperation m : members) {
+                if (m.op() == OperationType.PUT) {
+                    wal.append(new OperationRecord(seqCursor, OperationType.PUT,
+                            m.key(), m.value(), m.ttlMillis(), now, gid));
+                } else {
+                    wal.append(new OperationRecord(seqCursor, OperationType.DELETE,
+                            m.key(), null, 0L, now, gid));
+                }
+                seqCursor++;
+            }
+            long commitSeq = seqCursor;
+            wal.append(OperationRecord.frame(seqCursor, OperationType.GCOMMIT, gid, 0L, now));
+            seqCursor++;
+            nextSeq = seqCursor;
+
+            // ------------------------------------------------ 5. GCOMMIT 落盘成功后才变更内存
+            for (String evictedKey : evictionPlan) {
+                CacheEntry removed = store.remove(evictedKey);
+                tracker.remove(evictedKey);
+                if (removed != null) {
+                    evictionCount++;
+                }
+            }
+            for (GroupOperation m : members) {
+                if (m.op() == OperationType.PUT) {
+                    store.put(m.key(), new CacheEntry(m.value(), now + m.ttlMillis()));
+                    tracker.touch(m.key());
+                    totalPutCount++;
+                } else {
+                    store.remove(m.key());
+                    tracker.remove(m.key());
+                    totalDeleteCount++;
+                }
+            }
+            groupCommitCount++;
+            groupSuccessCount++;
+            committedGroups.put(gid, new CommittedGroup(List.copyOf(members), beginSeq, commitSeq,
+                    List.copyOf(evictionPlan)));
+            int live = liveCountLocked();
+            log.info("整组提交成功 groupId={} 成员={} keys={} 淘汰={} beginSeq={} commitSeq={} live={}",
+                    gid, members.size(), memberKeys(members), evictionPlan, beginSeq, commitSeq, live);
+            return new GroupCommitResult(gid, GroupCommitResult.Outcome.COMMITTED, members.size(),
+                    List.copyOf(evictionPlan), beginSeq, commitSeq, live);
+        } catch (RuntimeException e) {
+            // WAL 中途失败：内存尚未改动；把文件截回本组开始前的提交点并归还序号。
+            nextSeq = beginSeq;
+            try {
+                wal.truncateTo(commitPoint);
+            } catch (RuntimeException truncateFailure) {
+                // 即使在线截断失败，重启时 readAll 也会把未闭合组整体截除；这里保留原始异常链路。
+                e.addSuppressed(truncateFailure);
+            }
+            log.error("整组持久化失败 groupId={} 已回滚WAL至提交点={} 内存无改动", gid, commitPoint, e);
+            throw e;
+        }
+    }
+
+    private static List<String> memberKeys(List<GroupOperation> members) {
+        List<String> keys = new ArrayList<>(members.size());
+        for (GroupOperation m : members) {
+            keys.add(m.op().name() + ":" + m.key());
+        }
+        return keys;
+    }
+
+    private int liveCountLocked() {
+        long now = System.currentTimeMillis();
+        int live = 0;
+        for (CacheEntry e : store.values()) {
+            if (now < e.expireAtMs()) {
+                live++;
+            }
+        }
+        return live;
+    }
+
+    private void validateGroupRequest(List<GroupOperation> members) {
+        if (members == null || members.isEmpty()) {
+            throw new InvalidRequestException("整组提交的成员列表不得为空");
+        }
+        if (members.size() > 10_000) {
+            throw new InvalidRequestException("整组成员数超过上限 10000: " + members.size());
+        }
+        for (GroupOperation m : members) {
+            if (m == null) {
+                throw new InvalidRequestException("整组成员不得为 null");
+            }
+        }
+    }
+
+    private void validateGroupId(String groupId) {
+        if (groupId == null || groupId.isEmpty()) {
+            throw new InvalidRequestException("groupId 不得为空");
+        }
+        if (groupId.length() > properties.getMaxKeyLength()) {
+            throw new InvalidRequestException(
+                    "groupId 超长: " + groupId.length() + " > " + properties.getMaxKeyLength());
+        }
+    }
+
+    /** 已确认整组的持久化元数据（重试去重与结果可观测）。 */
+    private record CommittedGroup(List<GroupOperation> spec, long beginSeq, long commitSeq,
+                                  List<String> evictedKeys) {
+    }
+
+    @Override
     public synchronized Metrics metrics() {
         ensureReady();
         long now = System.currentTimeMillis();
@@ -184,7 +443,8 @@ public final class DurableKvCache implements KeyValueCache {
         }
         return new Metrics(properties.getMaxEntries(), live, totalPutCount, totalDeleteCount,
                 evictionCount, expiredScanCount, nearest == Long.MAX_VALUE ? -1L : nearest,
-                ready ? "READY" : "RECOVERING");
+                ready ? "READY" : "RECOVERING", groupCommitCount, groupSuccessCount,
+                groupDuplicateCount, groupRejectedStaleCount, groupRejectedCapacityCount);
     }
 
     // ------------------------------------------------------------------ 恢复支持
@@ -198,6 +458,71 @@ public final class DurableKvCache implements KeyValueCache {
         if (ready) {
             throw new StateConflictException("缓存已就绪，禁止重复恢复以避免数据叠加");
         }
+        RecoverySummary summary = applyReplayRecord(r, now);
+        advanceSeq(r.seq());
+        return summary;
+    }
+
+    /**
+     * 整组重放：仅在恢复收到匹配的 GBEGIN/GCOMMIT 后调用一次。
+     * 成员按日志顺序应用到内存（不写 WAL、不改容量），整组要么随 GCOMMIT 一起出现，
+     * 要么被 WAL 读取层整体截除——恢复路径上不存在"恢复一半"的组。
+     *
+     * @param memberSeqs 与 members 一一对应的成员序号，用于推进 nextSeq
+     */
+    public synchronized List<RecoverySummary> replayGroup(String groupId, List<OperationRecord> members,
+                                                          List<Long> memberSeqs, long beginSeq,
+                                                          long commitSeq, long now) {
+        if (ready) {
+            throw new StateConflictException("缓存已就绪，禁止重复恢复以避免数据叠加");
+        }
+        if (committedGroups.containsKey(groupId)) {
+            // WAL 中出现第二个已闭合的同 groupId 组：日志级幂等键冲突，恢复必须失败，拒绝带半套数据服务。
+            throw new RecoveryException("WAL 中整组 groupId=" + groupId + " 重复出现，恢复中止以避免结果叠加");
+        }
+        List<RecoverySummary> summaries = new ArrayList<>(members.size());
+        for (OperationRecord r : members) {
+            summaries.add(applyReplayRecord(r, now));
+        }
+        advanceSeq(beginSeq);
+        for (Long s : memberSeqs) {
+            advanceSeq(s);
+        }
+        advanceSeq(commitSeq);
+        // 去重比较只面向调用方提交的 PUT/DELETE 成员；帧内 EVICT 是容量副产物，不进入规格。
+        // DELETE 保留 ttlMillis=0L，与在线提交时 GroupOperation.delete(...) 构造的规格完全一致。
+        List<GroupOperation> spec = members.stream()
+                .filter(r -> r.type() == OperationType.PUT || r.type() == OperationType.DELETE)
+                .map(r -> new GroupOperation(r.type(), r.key(),
+                        r.type() == OperationType.PUT ? r.value() : null,
+                        r.type() == OperationType.PUT ? r.ttlMillis() : 0L))
+                .toList();
+        List<String> evicted = members.stream()
+                .filter(r -> r.type() == OperationType.EVICT)
+                .map(OperationRecord::key)
+                .toList();
+        committedGroups.put(groupId, new CommittedGroup(spec, beginSeq, commitSeq, evicted));
+        groupCommitCount++;
+        groupSuccessCount++;
+        return summaries;
+    }
+
+    /** GBEGIN/GCOMMIT 帧记录只推进序号，不改变内存。 */
+    public synchronized void replayFrame(OperationRecord r) {
+        if (ready) {
+            throw new StateConflictException("缓存已就绪，禁止重复恢复以避免数据叠加");
+        }
+        advanceSeq(r.seq());
+    }
+
+    private void advanceSeq(long seq) {
+        if (seq + 1 > nextSeq) {
+            nextSeq = seq + 1;
+        }
+    }
+
+    /** 恢复全序中单条记录的内存应用（PUT/DELETE/EVICT），不触碰 WAL 与序号。 */
+    private RecoverySummary applyReplayRecord(OperationRecord r, long now) {
         switch (r.type()) {
             case PUT -> {
                 long expireAt = r.timestampMs() + r.ttlMillis();
@@ -210,17 +535,11 @@ public final class DurableKvCache implements KeyValueCache {
                 boolean overwrite = store.containsKey(r.key());
                 store.put(r.key(), new CacheEntry(r.value(), expireAt));
                 tracker.touch(r.key());
-                if (r.seq() + 1 > nextSeq) {
-                    nextSeq = r.seq() + 1;
-                }
                 return overwrite ? RecoverySummary.putOverwrite() : RecoverySummary.putNew();
             }
             case DELETE -> {
                 boolean had = store.remove(r.key()) != null;
                 tracker.remove(r.key());
-                if (r.seq() + 1 > nextSeq) {
-                    nextSeq = r.seq() + 1;
-                }
                 return had ? RecoverySummary.deleteHit() : RecoverySummary.deleteMiss();
             }
             case EVICT -> {
@@ -230,9 +549,6 @@ public final class DurableKvCache implements KeyValueCache {
                 if (had) {
                     // 恢复历史淘汰计数，使重启后 /admin/metrics 的淘汰结论连续可观测。
                     evictionCount++;
-                }
-                if (r.seq() + 1 > nextSeq) {
-                    nextSeq = r.seq() + 1;
                 }
                 return had ? RecoverySummary.evictHit() : RecoverySummary.deleteMiss();
             }

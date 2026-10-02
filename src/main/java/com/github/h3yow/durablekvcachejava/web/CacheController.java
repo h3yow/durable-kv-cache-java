@@ -2,13 +2,19 @@ package com.github.h3yow.durablekvcachejava.web;
 
 import com.github.h3yow.durablekvcachejava.cache.KeyValueCache;
 import com.github.h3yow.durablekvcachejava.cache.KeyValueCache.PutResult;
+import com.github.h3yow.durablekvcachejava.cache.CacheExceptions.InvalidRequestException;
+import com.github.h3yow.durablekvcachejava.core.GroupCommitResult;
+import com.github.h3yow.durablekvcachejava.core.GroupOperation;
+import com.github.h3yow.durablekvcachejava.core.OperationType;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -17,6 +23,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -93,5 +100,46 @@ public class CacheController {
     @GetMapping("/admin/metrics")
     public KeyValueCache.Metrics metrics() {
         return cache.metrics();
+    }
+
+    /**
+     * 整组原子提交：POST /cache/groups?groupId=可选，body 为成员操作数组的 JSON。
+     * 成功 200 返回 {@code outcome=COMMITTED/DUPLICATE} 及淘汰键、序号、存活键数；
+     * 参数错误 400、成员已过期/已删除 412、整组容量不足 507、持久化失败 500。
+     */
+    @PostMapping("/groups")
+    public ResponseEntity<Map<String, Object>> commitGroup(
+            @RequestParam(name = "groupId", required = false) String groupId,
+            @RequestBody GroupCommitRequest request) {
+        if (request == null || request.getMembers() == null) {
+            throw new InvalidRequestException("请求体必须包含非空 members 数组");
+        }
+        List<GroupOperation> members = new java.util.ArrayList<>(request.getMembers().size());
+        for (GroupCommitRequest.Member m : request.getMembers()) {
+            if (m == null) {
+                throw new InvalidRequestException("members 中不得包含 null 元素");
+            }
+            if ("PUT".equalsIgnoreCase(m.getOp())) {
+                members.add(GroupOperation.put(m.getKey(), m.getValue(),
+                        m.getTtlMillis() == null ? 0L : m.getTtlMillis()));
+            } else if ("DELETE".equalsIgnoreCase(m.getOp())) {
+                members.add(GroupOperation.delete(m.getKey()));
+            } else {
+                throw new InvalidRequestException(
+                        "不支持的成员操作 op=" + m.getOp() + "，仅支持 PUT / DELETE");
+            }
+        }
+        GroupCommitResult result = cache.commitGroup(groupId, members);
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("status", "OK");
+        resp.put("groupId", result.groupId());
+        resp.put("outcome", result.outcome().name());
+        resp.put("duplicate", result.duplicate());
+        resp.put("memberCount", result.memberCount());
+        resp.put("evictedKeys", result.evictedKeys());
+        resp.put("beginSeq", result.beginSeq());
+        resp.put("commitSeq", result.commitSeq());
+        resp.put("liveEntries", result.liveEntries());
+        return ResponseEntity.ok(resp);
     }
 }

@@ -65,4 +65,9 @@ public final class LruEvictionTracker implements EvictionTracker {
     public java.util.List<String> snapshotOldestFirst() {
         return Collections.unmodifiableList(new java.util.ArrayList<>(order.keySet()));
     }
+
+    @Override
+    public java.util.List<String> peekOldestFirst() {
+        return snapshotOldestFirst();
+    }
 }
