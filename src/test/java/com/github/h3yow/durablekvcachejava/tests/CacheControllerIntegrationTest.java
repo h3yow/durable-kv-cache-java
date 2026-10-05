@@ -6,7 +6,11 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
+
+import java.nio.file.Path;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -16,13 +20,22 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 /**
  * HTTP 入口端到端：成功、过期、删除、容量与非法请求的错误码均可区分。
- * 使用独立 data 目录由 application-test.properties 指定，避免污染工作区。
+ * 数据目录由 {@link IsolatedTestStorage} 在类加载时分配（target/test-data/ 下、每轮运行唯一），
+ * 不与其它用例共用，同一工作区连续多轮执行互不影响。
  */
-@SpringBootTest(args = "--kv-cache.data-dir=target/it-data")
+@SpringBootTest
 @AutoConfigureMockMvc
 class CacheControllerIntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(CacheControllerIntegrationTest.class);
+
+    /** 本轮运行独有的全新数据目录（类加载时创建，先于 Spring 上下文）。 */
+    private static final Path DATA_DIR = IsolatedTestStorage.freshDir("cache-http");
+
+    @DynamicPropertySource
+    static void cacheProps(DynamicPropertyRegistry registry) {
+        registry.add("kv-cache.data-dir", () -> DATA_DIR.toString());
+    }
 
     @Autowired
     private MockMvc mvc;

@@ -7,7 +7,11 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
+
+import java.nio.file.Path;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -16,13 +20,22 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 /**
  * 整组提交 HTTP 端到端：成功、幂等、前置失败 412、串组 409、容量 507、参数 400、组状态查询。
- * 独立数据目录 target/it-group-data，不与其它集成测试共用。
+ * 数据目录由 {@link IsolatedTestStorage} 在类加载时分配（target/test-data/ 下、每轮运行唯一），
+ * 同一工作区连续多轮执行互不复用，上一轮残留状态不会进入本轮判定。
  */
-@SpringBootTest(args = "--kv-cache.data-dir=target/it-group-data")
+@SpringBootTest
 @AutoConfigureMockMvc
 class GroupControllerIntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(GroupControllerIntegrationTest.class);
+
+    /** 本轮运行独有的全新数据目录（类加载时创建，先于 Spring 上下文）。 */
+    private static final Path DATA_DIR = IsolatedTestStorage.freshDir("group-http");
+
+    @DynamicPropertySource
+    static void cacheProps(DynamicPropertyRegistry registry) {
+        registry.add("kv-cache.data-dir", () -> DATA_DIR.toString());
+    }
 
     @Autowired
     private MockMvc mvc;

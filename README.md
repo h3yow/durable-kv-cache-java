@@ -251,8 +251,22 @@ TXEND(groupId, 淘汰数M)
 mvn test
 ```
 
-43 个测试全部本地运行（WAL 均落在 JUnit `@TempDir`；Spring 上下文测试用命令行参数
-`--kv-cache.data-dir` 指向各自独立目录），不依赖外部服务：
+49 个测试全部本地运行，不依赖外部服务。**用例之间的数据完全隔离**：
+
+- 纯状态机用例（`DurableKvCacheTest` / `GroupCommitTest` / `GroupRecoveryTest` 等）
+  的 WAL 落在 JUnit `@TempDir`，每个用例一个独立目录；
+- Spring 上下文用例（`ApplicationTests` / `CacheControllerIntegrationTest` /
+  `GroupControllerIntegrationTest`）通过 `IsolatedTestStorage.freshDir(...)`
+  在**类加载时**（先于 Spring 上下文创建）分配本轮独有的全新目录，形如
+  `target/test-data/<用例名>-<时间戳>-<随机串>`，再由 `@DynamicPropertySource`
+  注入 `kv-cache.data-dir`；创建时会把绝对路径打进日志；
+- `ProcessRestartSimulationTest` 每个用例独立子目录、每个上下文唯一标记。
+
+因此**同一工作区连续执行任意多次 `mvn test`（不清构建产物）结论都一致**：
+每一轮、每个用例都从干净状态开始，上一轮（哪怕被强杀）留在磁盘上的 WAL
+不会被本轮复用，本轮的第一次整组提交永远被判定为全新的第一次提交（`OK`），
+只有调用方真的用相同 `groupId` + 相同成员重复提交才得到 `OK_DUPLICATE`。
+`mvn clean` 可一并清掉所有历史 `target/test-data/*` 目录。
 
 | 测试类 | 覆盖内容 |
 |---|---|
@@ -261,14 +275,29 @@ mvn test
 | `GroupCommitTest` | 整组原子生效、UPDATE/DELETE 混合、前置失败零副作用（已过期/已删除/INSERT 冲突）、重启前后幂等、groupId 串组冲突、参数错误、容量刚好放下/差一个/整组大于上限/删除释放容量且不误淘汰成员 |
 | `GroupConcurrencyTest` | 两组（键在 c 上重叠）12 写线程 + 4 快照读线程高并发：半组可见态为 0，最终为单一确定全序 |
 | `GroupRecoveryTest` | 已确认整组完整恢复、TXEND 前崩溃首次重启即整段丢弃（无半组）、半行撕裂同样丢弃、损坏闭合帧 CRC 中止、组淘汰结论跨重启、连续 3 次冷启动不叠加 |
-| `GroupControllerIntegrationTest` | HTTP 200/OK_DUPLICATE/412/409/507/400 错误码可区分、组状态 404（独立目录 `target/it-group-data`） |
+| `GroupControllerIntegrationTest` | HTTP 200/OK_DUPLICATE/412/409/507/400 错误码可区分、组状态 404（每轮独立目录 `target/test-data/group-http-*`） |
 | `RecoveryTest` | kill 后重放（重写/删除/过期/删后重写）、淘汰结论跨重启保持、重复恢复拒绝、WAL 损坏中止、崩溃残留容忍 |
-| `CacheControllerIntegrationTest` | HTTP 成功/404/400 错误码、metrics 端点（独立目录 `target/it-data`） |
+| `CacheControllerIntegrationTest` | HTTP 成功/404/400 错误码、metrics 端点（每轮独立目录 `target/test-data/cache-http-*`） |
 | `ProcessRestartSimulationTest` | 真实关闭并重建整个 Spring 上下文（每用例独立子目录、每上下文唯一）：单键与整组跨「进程」保持、整组不半组、跨进程重复提交幂等 |
+| `RepeatRunStabilityTest` | **反复执行稳定性**：同一套整组用例连续 3 轮（每轮全新目录）结论逐位一致；上一轮被强杀留下的未闭合半组既不泄漏进下一轮，重启后也被整帧丢弃、同内容全新提交仍判 `OK_FIRST` 而非误判重复；同一组操作两种执行顺序结论与恢复后快照一致 |
 
-单测日志中打印了**操作的是哪一组（groupId）、涉及哪些键、判定依据（now/expireAt、
-LRU 位置、动作清单、序号区间、错误原因）与恢复结果（整组恢复数/未闭合帧丢弃数）**，
-可在 `target/surefire-reports/` 或控制台查看。
+单测日志中打印了**每个用例操作的存储目录、哪一组（groupId）、涉及哪些键、
+判定依据（now/expireAt、LRU 位置、动作清单、序号区间、错误原因）与恢复结果
+（整组恢复数/未闭合帧丢弃数）**，可在 `target/surefire-reports/` 或控制台查看。
+
+### 反复执行与顺序变化
+
+```bash
+mvn test                                   # 第 1 遍
+mvn test                                   # 第 2 遍（不清产物），结论必须与第 1 遍一致
+mvn test -Dsurefire.runOrder=random        # 随机顺序执行，结论仍然一致
+mvn clean test                             # 清掉全部历史测试数据后执行
+```
+
+预期结论：任意重复执行、任意执行顺序下 49 个测试全部通过；整组 HTTP 用例中
+`http-grp-1` 的首次提交永远返回 `status=OK`、`duplicate=false`，同请求体重放
+才返回 `OK_DUPLICATE`；`RepeatRunStabilityTest` 日志可直接看到三轮独立目录的
+判定结论逐位相同。
 
 ### 手工复现整组原子性与崩溃恢复
 
@@ -351,4 +380,5 @@ eviction/    EvictionTracker 接口、LruEvictionTracker(access-order LRU, 只�
 recovery/    RecoveryService(两遍帧感知重放/未闭合帧截除)、RecoveryRunner(启动确认)
 config/      CacheProperties(配置校验)、CacheBeans(恢复屏障式装配)、CachedBodyFilter
 web/         CacheController(单键+整组端点)、GlobalExceptionHandler、dto/GroupCommitRequest、CachedBodyFilter
+tests/       IsolatedTestStorage(每轮/每用例独立数据目录分配) + 各测试类
 ```
