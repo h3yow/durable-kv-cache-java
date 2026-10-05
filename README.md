@@ -251,8 +251,17 @@ TXEND(groupId, 淘汰数M)
 mvn test
 ```
 
-43 个测试全部本地运行（WAL 均落在 JUnit `@TempDir`；Spring 上下文测试用命令行参数
-`--kv-cache.data-dir` 指向各自独立目录），不依赖外部服务：
+49 个测试全部本地运行，不依赖外部服务。数据隔离方式：
+
+- 单元/状态机测试：WAL 均落在 JUnit `@TempDir`（每用例由 JUnit 分配全新目录）；
+- Spring 上下文测试（`ApplicationTests` / `CacheControllerIntegrationTest` /
+  `GroupControllerIntegrationTest`）：通过 `@DynamicPropertySource` 在上下文启动前调用
+  测试工具 `IsolatedTestDir.fresh(name)`，把 `kv-cache.data-dir` 指向
+  `target/test-data/<专属名>`——**每个测试类一个专属目录，且每轮执行前先整体清除
+  上一轮残留**（含被强杀留下的未闭合组帧、半行撕裂等），再重建为空目录。
+  因此同一工作区里**不 clean 连续执行任意多次、以任意顺序执行**，结论都一致：
+  本轮的第一次提交永远判定为全新提交，不会被磁盘上的历史状态误判为重复提交；
+  只有调用方在同一轮内真的重放同一组内容，才返回 `OK_DUPLICATE`。
 
 | 测试类 | 覆盖内容 |
 |---|---|
@@ -261,14 +270,40 @@ mvn test
 | `GroupCommitTest` | 整组原子生效、UPDATE/DELETE 混合、前置失败零副作用（已过期/已删除/INSERT 冲突）、重启前后幂等、groupId 串组冲突、参数错误、容量刚好放下/差一个/整组大于上限/删除释放容量且不误淘汰成员 |
 | `GroupConcurrencyTest` | 两组（键在 c 上重叠）12 写线程 + 4 快照读线程高并发：半组可见态为 0，最终为单一确定全序 |
 | `GroupRecoveryTest` | 已确认整组完整恢复、TXEND 前崩溃首次重启即整段丢弃（无半组）、半行撕裂同样丢弃、损坏闭合帧 CRC 中止、组淘汰结论跨重启、连续 3 次冷启动不叠加 |
-| `GroupControllerIntegrationTest` | HTTP 200/OK_DUPLICATE/412/409/507/400 错误码可区分、组状态 404（独立目录 `target/it-group-data`） |
+| `GroupControllerIntegrationTest` | HTTP 200/OK_DUPLICATE/412/409/507/400 错误码可区分、组状态 404（专属目录 `target/test-data/it-group-data`，每轮先清残留） |
 | `RecoveryTest` | kill 后重放（重写/删除/过期/删后重写）、淘汰结论跨重启保持、重复恢复拒绝、WAL 损坏中止、崩溃残留容忍 |
-| `CacheControllerIntegrationTest` | HTTP 成功/404/400 错误码、metrics 端点（独立目录 `target/it-data`） |
+| `CacheControllerIntegrationTest` | HTTP 成功/404/400 错误码、metrics 端点（专属目录 `target/test-data/it-data`，每轮先清残留） |
 | `ProcessRestartSimulationTest` | 真实关闭并重建整个 Spring 上下文（每用例独立子目录、每上下文唯一）：单键与整组跨「进程」保持、整组不半组、跨进程重复提交幂等 |
+| `RepeatableRunIsolationTest` | **可重复执行性**：同套场景连续 3 轮结论逐字一致；上一轮被强杀留下未闭合组帧+半行撕裂时，下一轮从干净状态开始且首次提交必为全新提交；场景执行顺序变化不改变任何结论 |
 
 单测日志中打印了**操作的是哪一组（groupId）、涉及哪些键、判定依据（now/expireAt、
 LRU 位置、动作清单、序号区间、错误原因）与恢复结果（整组恢复数/未闭合帧丢弃数）**，
-可在 `target/surefire-reports/` 或控制台查看。
+可在 `target/surefire-reports/` 或控制台查看。目录隔离事件（发现上一轮残留 → 已清除）
+也会打印，例如：
+`测试目录隔离 name=it-group-data ... 依据=发现上一轮残留(1个文件,可能为中断残留) 恢复结果=已整体清除, 本轮从干净状态开始`。
+
+### 反复执行同一套验证
+
+```bash
+mvn test          # 第 1 遍
+mvn test          # 第 2 遍（不 clean，直接重跑）
+mvn test          # 第 N 遍……结论必须每一遍都相同：49 个测试全绿
+```
+
+- **用例之间的数据隔离**：每个测试类/每个场景使用彼此独立的存储位置
+  （`@TempDir` 或 `target/test-data/<专属名>`），任何用例都不读写其它用例的目录，
+  因此执行顺序变化（如 `mvn test -Dtest=...` 任意组合、`-Dsurefire.runOrder=reverse`）
+  不影响结论。
+- **轮次之间的隔离**：Spring 上下文测试在每轮启动前由 `IsolatedTestDir.fresh` 清除
+  同名目录的上一轮残留。即使上一轮执行中途失败或被 `kill -9`（目录里留下未闭合
+  组帧、半行撕裂等半套数据），下一轮也从干净状态开始，给出确定结论，残留不会被
+  算进本轮结果。
+- **重复执行的预期结论**：每一遍的整组 HTTP 用例中，`http-grp-1` 的第一次提交都必须
+  返回 `status=OK, duplicate=false`（本轮全新提交），同一轮内的第二次相同提交才返回
+  `status=OK_DUPLICATE, duplicate=true`（真重放才幂等）。如果某一遍第一次提交就变成
+  `OK_DUPLICATE`，说明轮次隔离被破坏，属于缺陷。
+- 上述性质由 `RepeatableRunIsolationTest` 自动化固化（连续 3 轮逐字一致、强杀残留
+  清理、顺序无关），无需手工核对。
 
 ### 手工复现整组原子性与崩溃恢复
 

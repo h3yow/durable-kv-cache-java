@@ -7,6 +7,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -16,13 +18,21 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 /**
  * 整组提交 HTTP 端到端：成功、幂等、前置失败 412、串组 409、容量 507、参数 400、组状态查询。
- * 独立数据目录 target/it-group-data，不与其它集成测试共用。
+ * 数据目录由 {@link IsolatedTestDir} 在 Spring 上下文启动前分配：专属于本测试类、
+ * 且每轮执行前清除上一轮残留，因此同一工作区反复执行（不 clean）结论一致——
+ * 本轮的第一次提交永远判定为全新提交，不会被磁盘上的历史状态误判为重复。
  */
-@SpringBootTest(args = "--kv-cache.data-dir=target/it-group-data")
+@SpringBootTest
 @AutoConfigureMockMvc
 class GroupControllerIntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(GroupControllerIntegrationTest.class);
+
+    @DynamicPropertySource
+    static void isolatedDataDir(DynamicPropertyRegistry registry) {
+        registry.add("kv-cache.data-dir",
+                () -> IsolatedTestDir.fresh("it-group-data").toString());
+    }
 
     @Autowired
     private MockMvc mvc;
